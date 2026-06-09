@@ -21,6 +21,7 @@ Run:  python generate.py "When was Infinity Hall originally opened?"
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 from dotenv import load_dotenv
@@ -78,6 +79,26 @@ def format_context(chunks: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
+# Matches the [Doc N] citations the model is instructed to emit, e.g.
+# "[Doc 1]", "[doc 2]", "[Docs 1, 3]", "[Doc 1 and 2]".
+_CITATION_RE = re.compile(r"\[docs?\s+([\d,\sand]+?)\]", re.IGNORECASE)
+
+
+def cited_doc_numbers(answer_text: str) -> list[int]:
+    """Extract the 1-based [Doc N] numbers the model actually cited.
+
+    Returns them in first-mention order, de-duplicated. An empty list means
+    the answer contained no parseable citation.
+    """
+    seen: list[int] = []
+    for match in _CITATION_RE.finditer(answer_text):
+        for num in re.findall(r"\d+", match.group(1)):
+            n = int(num)
+            if n not in seen:
+                seen.append(n)
+    return seen
+
+
 # --- Generation ---------------------------------------------------------------
 
 def answer(question: str, top_k: int = DEFAULT_TOP_K) -> dict:
@@ -123,9 +144,19 @@ def answer(question: str, top_k: int = DEFAULT_TOP_K) -> dict:
     )
     response_text = completion.choices[0].message.content.strip()
 
-    # Programmatic source attribution: list unique sources, order preserved.
+    # Source attribution: report only the documents the model actually cited
+    # via [Doc N], not every retrieved chunk. This keeps the "Retrieved from"
+    # list honest — e.g. an answer grounded solely in [Doc 1] won't claim the
+    # other top-k chunks (different files) as sources.
+    cited = cited_doc_numbers(response_text)
+    cited_chunks = [chunks[n - 1] for n in cited if 1 <= n <= len(chunks)]
+    if not cited_chunks:
+        # No parseable / in-range citation (e.g. the no-answer reply): fall back
+        # to the retrieved chunks so we don't silently drop attribution.
+        cited_chunks = chunks
+
     sources: list[str] = []
-    for c in chunks:
+    for c in cited_chunks:
         if c["source"] not in sources:
             sources.append(c["source"])
 
